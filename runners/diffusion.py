@@ -7,7 +7,11 @@ import numpy as np
 import tqdm
 import torch
 import torch.utils.data as data
+from torch import sqrt
+from torchvision.transforms.functional import to_pil_image
+import matplotlib.pyplot as plt
 
+from functions.denoising import compute_alpha
 from models.diffusion import Model
 from models.ema import EMAHelper
 from functions import get_optimizer
@@ -105,7 +109,12 @@ class Diffusion(object):
             shuffle=True,
             num_workers=config.data.num_workers,
         )
-        model = Model(config)
+        if config.model.type == "conditional":  # currently only support categorical conditioning
+            conditioning_vars = {attr: {'type': 'categorical', 'num_classes': num} for attr, num in
+                                 zip(config.data.attrs, config.data.attrs_cate_num)}
+            model = Model(config, conditioning_vars)
+        else:
+            model = Model(config)
 
         model = model.to(self.device)
         model = torch.nn.DataParallel(model)
@@ -127,6 +136,7 @@ class Diffusion(object):
             optimizer.load_state_dict(states[1])
             start_epoch = states[2]
             step = states[3]
+            print("Resuming training from checkpoint with START EPOCH: {}, STEP: {}".format(start_epoch, step))
             if self.config.model.ema:
                 ema_helper.load_state_dict(states[4])
 
@@ -143,13 +153,16 @@ class Diffusion(object):
                 x = data_transform(self.config, x)
                 e = torch.randn_like(x)
                 b = self.betas
+                # Send every values in dict y to device
+                if isinstance(y, dict):
+                    y = {k: v.to(self.device) for k, v in y.items()}
 
                 # antithetic sampling
                 t = torch.randint(
                     low=0, high=self.num_timesteps, size=(n // 2 + 1,)
                 ).to(self.device)
                 t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
-                loss = loss_registry[config.model.type](model, x, t, e, b)
+                loss = loss_registry[config.model.type](model, x, t, e, b, y)
 
                 tb_logger.add_scalar("loss", loss, global_step=step)
 
@@ -333,7 +346,7 @@ class Diffusion(object):
         for i in range(x.size(0)):
             tvu.save_image(x[i], os.path.join(self.args.image_folder, f"{i}.png"))
 
-    def sample_image(self, x, model, last=True):
+    def sample_image(self, x, model, last=True, mid_num_timesteps=None, y=None):
         try:
             skip = self.args.skip
         except Exception:
@@ -342,7 +355,10 @@ class Diffusion(object):
         if self.args.sample_type == "generalized":
             if self.args.skip_type == "uniform":
                 skip = self.num_timesteps // self.args.timesteps
-                seq = range(0, self.num_timesteps, skip)
+                if mid_num_timesteps is not None and mid_num_timesteps < self.num_timesteps:
+                    seq = range(0, mid_num_timesteps, skip)
+                else:
+                    seq = range(0, self.num_timesteps, skip)
             elif self.args.skip_type == "quad":
                 seq = (
                     np.linspace(
@@ -350,12 +366,18 @@ class Diffusion(object):
                     )
                     ** 2
                 )
-                seq = [int(s) for s in list(seq)]
+                if mid_num_timesteps is not None:
+                    raise NotImplementedError
+                else:
+                    seq = [int(s) for s in list(seq)]
             else:
                 raise NotImplementedError
             from functions.denoising import generalized_steps
 
-            xs = generalized_steps(x, seq, model, self.betas, eta=self.args.eta)
+            if y is not None:
+                xs = generalized_steps(x, seq, model, self.betas, y=y, eta=self.args.eta)
+            else:
+                xs = generalized_steps(x, seq, model, self.betas, eta=self.args.eta)
             x = xs
         elif self.args.sample_type == "ddpm_noisy":
             if self.args.skip_type == "uniform":
@@ -381,4 +403,252 @@ class Diffusion(object):
         return x
 
     def test(self):
-        pass
+
+        ## WORKING CODE ##
+        if self.config.model.type == "conditional":  # currently only support categorical conditioning
+            conditioning_vars = {attr: {'type': 'categorical', 'num_classes': num} for attr, num in
+                                 zip(self.config.data.attrs, self.config.data.attrs_cate_num)}
+            model = Model(self.config, conditioning_vars)
+        else:
+            model = Model(self.config)
+
+        if not self.args.use_pretrained:
+            if getattr(self.config.sampling, "ckpt_id", None) is None:
+                states = torch.load(
+                    os.path.join(self.args.log_path, "ckpt.pth"),
+                    map_location=self.config.device,
+                )
+            else:
+                states = torch.load(
+                    os.path.join(
+                        self.args.log_path, f"ckpt_{self.config.sampling.ckpt_id}.pth"
+                    ),
+                    map_location=self.config.device,
+                )
+            model = model.to(self.device)
+            model = torch.nn.DataParallel(model)
+            model.load_state_dict(states[0], strict=True)
+
+            if self.config.model.ema:
+                ema_helper = EMAHelper(mu=self.config.model.ema_rate)
+                ema_helper.register(model)
+                ema_helper.load_state_dict(states[-1])
+                ema_helper.ema(model)
+            else:
+                ema_helper = None
+        else:
+            raise NotImplementedError
+
+        model.eval()
+        config = self.config
+        img_id = len(glob.glob(f"{self.args.image_folder}/*"))
+        print(f"starting from image {img_id}")
+        total_n_samples = 5
+        config.sampling.batch_size = total_n_samples
+        n_rounds = (total_n_samples - img_id) // config.sampling.batch_size
+
+        with torch.no_grad():
+            for _ in tqdm.tqdm(
+                    range(n_rounds), desc="Generating image samples for test."
+            ):
+                n = config.sampling.batch_size
+                x = torch.randn(
+                    n,
+                    config.data.channels,
+                    config.data.image_size,
+                    config.data.image_size,
+                    device=self.device,
+                )
+                y = {
+                    'Male': torch.tensor([0, 0, 0, 0, 0]).long().to(self.device),  # tensor of shape [batch_size], dtype=torch.long
+                    'Young': torch.tensor([1, 1, 1, 1, 1]).long().to(self.device),
+                    'Gray_Hair': torch.tensor([1, 1, 1, 1, 1]).long().to(self.device)
+                }
+                x = self.sample_image(x, model, y=y)
+                # Clone x to keep the original data, detach x to avoid backpropagation
+                x_t = x.clone().to(self.device).detach()
+                x = inverse_data_transform(config, x)
+                for i in range(n):
+                    tvu.save_image(
+                        x[i], os.path.join(self.args.image_folder, f"{img_id}.png")
+                    )
+                    img_id += 1
+                exit(1)
+
+                # Send it to half-noisy
+                mid_num_timesteps = self.num_timesteps - self.num_timesteps // 2
+                for t in tqdm.tqdm(range(0, mid_num_timesteps - 1)):
+                    t_tensor = torch.ones(config.sampling.batch_size) * t
+                    t_tensor = t_tensor.to(self.device)
+                    alpha_tp1 = torch.tensor(compute_alpha(self.betas, (t_tensor + 1).long())).to(self.device)
+                    alpha_t = torch.tensor(compute_alpha(self.betas, t_tensor.long())).to(self.device)
+                    eplison_theta = model(x_t, t_tensor)
+                    x_tp1 = torch.sqrt(alpha_tp1 / alpha_t) * (x_t - torch.sqrt(1 - alpha_t) * eplison_theta) + torch.sqrt(1 - alpha_tp1) * eplison_theta
+                    x_t = x_tp1
+
+                y = {
+                    'Male': torch.tensor([0, 1, 1]).long().to(self.device),  # tensor of shape [batch_size], dtype=torch.long
+                    'Young': torch.tensor([0, 1, 1]).long().to(self.device),
+                    'Gray_Hair': torch.tensor([1, 0, 0]).long().to(self.device)
+                }
+
+                x = self.sample_image(x_t, model, mid_num_timesteps=mid_num_timesteps, y=y)
+                x = inverse_data_transform(config, x)
+                for i in range(n):
+                    tvu.save_image(
+                        x[i], os.path.join(self.args.image_folder, f"{img_id}.png")
+                    )
+                    img_id += 1
+
+
+    def test2(self):
+        ## NEW ##
+        import os
+        import torch
+        from PIL import Image
+        from torchvision import transforms
+
+        # Define directories
+        image_dir = "celebahq_subset/images/"
+        attribute_file = "celebahq_subset/CelebAMask-HQ-attribute-anno.txt"
+
+        # Define the attributes of interest
+        attributes_of_interest = ["Male", "Young", "Gray_Hair"]
+
+        # Define transformations for the images
+        transform = transforms.Compose([
+            transforms.Resize((128, 128)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+
+        # Parse the attribute file and filter only those that have corresponding images and selected attributes
+        def parse_attributes(attribute_file, image_dir, attributes_of_interest):
+            available_images = set(os.listdir(image_dir))
+            with open(attribute_file, 'r') as f:
+                lines = f.readlines()
+            attri_names = lines[1].strip().split()
+
+            # Map attribute names to indices
+            attri_indices = {attr: attri_names.index(attr) for attr in attributes_of_interest}
+
+            attri_data = {}
+            for line in lines[2:]:
+                parts = line.strip().split()
+                image_name = parts[0]
+                if image_name in available_images:  # Only include if the image is available
+                    # Extract only the specified attributes
+                    attributes = [int(parts[attri_indices[attr] + 1]) for attr in attributes_of_interest]
+                    attributes = [0 if attr == -1 else 1 for attr in attributes]  # Change -1 to 0
+                    attri_data[image_name] = dict(zip(attributes_of_interest, attributes))
+            return attri_data
+
+        # Create a batch of images and corresponding batched attribute dictionary
+        def create_batch(image_dir, attribute_data):
+            image_names = list(attribute_data.keys())
+            batch_imgs = []
+            batch_attri_dict = {key: [] for key in attribute_data[image_names[0]]}
+
+            for img_name in image_names:
+                # Load and transform the image
+                img_path = os.path.join(image_dir, img_name)
+                img = Image.open(img_path).convert("RGB")
+                img_tensor = transform(img)
+                batch_imgs.append(img_tensor)
+
+                # Get the attributes for the image and append to corresponding list
+                attri_dict = attribute_data[img_name]
+                for key, value in attri_dict.items():
+                    batch_attri_dict[key].append(value)
+
+            # Stack the images into a tensor
+            batch_imgs = torch.stack(batch_imgs)
+
+            # Convert attribute lists into tensors
+            for key in batch_attri_dict:
+                batch_attri_dict[key] = torch.tensor(batch_attri_dict[key], dtype=torch.long)
+
+            return batch_imgs, batch_attri_dict
+
+        # Parse the attribute file with filtering
+        attribute_data = parse_attributes(attribute_file, image_dir, attributes_of_interest)
+        # Create a batch of images and corresponding batched attribute dictionary
+        batch_imgs, batch_ys = create_batch(image_dir, attribute_data)
+        # Move images and attributes to GPU
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        batch_imgs = batch_imgs.to(device)
+        list_img_tensors = [batch_imgs]
+        batch_ys = {key: value.to(device) for key, value in batch_ys.items()}
+        # Initialize the list with the original batch_ys
+        list_attri_dicts = [batch_ys]
+        # Iterate through each attribute in the batch_ys
+        for attr in batch_ys.keys():
+            # Create a new dictionary for the modified attributes
+            modified_batch_ys = {key: value.clone() for key, value in batch_ys.items()}
+            # Flip the value of the current attribute
+            modified_batch_ys[attr] = 1 - modified_batch_ys[attr]
+            # Append the modified attributes to the list
+            list_attri_dicts.append(modified_batch_ys)
+
+        if self.config.model.type == "conditional":  # currently only support categorical conditioning
+            conditioning_vars = {attr: {'type': 'categorical', 'num_classes': num} for attr, num in
+                                 zip(self.config.data.attrs, self.config.data.attrs_cate_num)}
+            model = Model(self.config, conditioning_vars)
+        else:
+            model = Model(self.config)
+
+        if not self.args.use_pretrained:
+            if getattr(self.config.sampling, "ckpt_id", None) is None:
+                states = torch.load(
+                    os.path.join(self.args.log_path, "ckpt.pth"),
+                    map_location=self.config.device,
+                )
+            else:
+                states = torch.load(
+                    os.path.join(
+                        self.args.log_path, f"ckpt_{self.config.sampling.ckpt_id}.pth"
+                    ),
+                    map_location=self.config.device,
+                )
+            model = model.to(self.device)
+            model = torch.nn.DataParallel(model)
+            model.load_state_dict(states[0], strict=True)
+
+            if self.config.model.ema:
+                ema_helper = EMAHelper(mu=self.config.model.ema_rate)
+                ema_helper.register(model)
+                ema_helper.load_state_dict(states[-1])
+                ema_helper.ema(model)
+            else:
+                ema_helper = None
+        else:
+            raise NotImplementedError
+
+        model.eval()
+        config = self.config
+        config.sampling.batch_size = batch_imgs.size(0)
+        for _i in range(1, len(list_attri_dicts)):
+            with torch.no_grad():
+                x_t = batch_imgs.clone().to(self.device)
+                # Send it to half-noisy
+                mid_num_timesteps = self.num_timesteps // 4
+                for t in tqdm.tqdm(range(0, mid_num_timesteps - 1)):
+                    t_tensor = torch.ones(config.sampling.batch_size) * t
+                    t_tensor = t_tensor.to(self.device)
+                    alpha_tp1 = torch.tensor(compute_alpha(self.betas, (t_tensor + 1).long())).to(self.device)
+                    alpha_t = torch.tensor(compute_alpha(self.betas, t_tensor.long())).to(self.device)
+                    eplison_theta = model(x_t, t_tensor)
+                    x_tp1 = torch.sqrt(alpha_tp1 / alpha_t) * (x_t - torch.sqrt(1 - alpha_t) * eplison_theta) + torch.sqrt(
+                        1 - alpha_tp1) * eplison_theta
+                    x_t = x_tp1
+                # Denoise the image
+                x = self.sample_image(x_t, model, mid_num_timesteps=mid_num_timesteps, y=list_attri_dicts[_i])
+                list_img_tensors.append(x.clone().to("cpu"))
+        # Make sure list_img_tensors, list_attri_dicts are all on CPU
+        list_img_tensors = [img_tensor.to("cpu") for img_tensor in list_img_tensors]
+        list_attri_dicts = [{key: value.to("cpu") for key, value in attri_dict.items()} for attri_dict in list_attri_dicts]
+        # Define a path to save the resulting collage
+        save_path = "collage_demo.png"
+        from functions.ckpt_util import draw_collage
+        # Call the function to create the collage
+        draw_collage(list_img_tensors, list_attri_dicts, save_path)

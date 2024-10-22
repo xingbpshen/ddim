@@ -7,8 +7,11 @@ from torchvision.datasets import CIFAR10
 from datasets.celeba import CelebA
 from datasets.ffhq import FFHQ
 from datasets.lsun import LSUN
+from datasets.celebahq import CelebAHQDataset
 from torch.utils.data import Subset
 import numpy as np
+import random
+import json
 
 
 class Crop(object):
@@ -57,6 +60,49 @@ def get_dataset(args, config):
             download=True,
             transform=test_transform,
         )
+
+    elif config.data.dataset == "CELEBAHQ":
+        dataset = CelebAHQDataset(image_dir=config.data.img_dir, attr_file=config.data.attr_file,
+                                  attrs=config.data.attrs)
+        # check if split file already exists
+        parent_dir = os.path.dirname(config.data.img_dir)
+
+        # Specify the path for the split_indices.json file
+        splits_file_path = os.path.join(parent_dir, 'split_indices.json')
+
+        try:
+            with open(splits_file_path, 'r') as f:
+                split_indices = json.load(f)
+                train_indices = split_indices['train']
+                val_indices = split_indices['val']
+                test_indices = split_indices['test']
+
+        except FileNotFoundError:
+            exit(-1)
+            # defining split size as .8:.1:.1
+            train_size = int(0.8 * len(dataset))
+            val_size = int(0.1 * len(dataset))
+            test_size = len(dataset) - train_size - val_size
+
+            indices = list(range(len(dataset)))
+            random.shuffle(indices)
+
+            train_indices = indices[:train_size]
+            val_indices = indices[train_size:train_size + val_size]
+            test_indices = indices[train_size + val_size:]
+
+            split_indices = {
+                'train': train_indices,
+                'val': val_indices,
+                'test': test_indices
+            }
+            with open(splits_file_path, 'w') as f:
+                json.dump(split_indices, f)
+
+        train_dataset = torch.utils.data.Subset(dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(dataset, val_indices)
+        test_dataset = torch.utils.data.Subset(dataset, test_indices)
+        dataset = train_dataset
 
     elif config.data.dataset == "CELEBA":
         cx = 89
@@ -200,6 +246,9 @@ def data_transform(config, X):
     if hasattr(config, "image_mean"):
         return X - config.image_mean.to(X.device)[None, ...]
 
+    if config.data.dataset == "CELEBAHQ":   # Pass, the transformation is already done in the datasets/celebahq.py
+        return X
+
     return X
 
 
@@ -211,5 +260,8 @@ def inverse_data_transform(config, X):
         X = torch.sigmoid(X)
     elif config.data.rescaled:
         X = (X + 1.0) / 2.0
+
+    if config.data.dataset == "CELEBAHQ":
+        X = X * 0.5 + 0.5  # undo norm, chane to -> [0, 1]
 
     return torch.clamp(X, 0.0, 1.0)

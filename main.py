@@ -155,7 +155,7 @@ def parse_args_and_config():
         logger.addHandler(handler1)
         logger.setLevel(level)
 
-        if args.sample:
+        if args.sample or args.test:
             os.makedirs(os.path.join(args.exp, "image_samples"), exist_ok=True)
             args.image_folder = os.path.join(
                 args.exp, "image_samples", args.image_folder

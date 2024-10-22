@@ -1,6 +1,9 @@
 import os, hashlib
 import requests
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from torchvision.transforms.functional import to_pil_image
+import torch
 
 URL_MAP = {
     "cifar10": "https://heibox.uni-heidelberg.de/f/869980b53bf5416c8a28/?dl=1",
@@ -70,3 +73,49 @@ def get_ckpt_path(name, root=None, check=False):
         md5 = md5_hash(path)
         assert md5 == MD5_MAP[name], md5
     return path
+
+
+def draw_collage(list_img_tensors, list_attri_dicts, save_path):
+    """
+    Draws a collage of images with their corresponding attributes.
+
+    Args:
+        list_img_tensors (list): List of (n_attri + 1) image tensors, each of shape (b, c, w, h).
+        list_attri_dicts (list): List of attribute dictionaries, each corresponding to an image tensor.
+                                 Each dictionary contains 'n_attri' attributes with tensor values.
+        save_path (str): Path to save the resulting collage image.
+    """
+    # Number of attributes + 1 (original image)
+    num_cols = len(list_img_tensors)
+    # Number of images in each batch
+    batch_size = list_img_tensors[0].shape[0]
+    # Get the width and height of images
+    _, _, img_w, img_h = list_img_tensors[0].shape
+
+    # Create a figure for the collage
+    fig, axes = plt.subplots(nrows=batch_size, ncols=num_cols, figsize=(num_cols * 3, batch_size * 3))
+    if batch_size == 1:
+        axes = [axes]  # Ensure axes is a list when batch_size is 1
+
+    for b in range(batch_size):
+        for col in range(num_cols):
+            # Convert the tensor to a PIL image and plot it
+            img_tensor = list_img_tensors[col][b]
+            img_tensor = torch.clamp(img_tensor * 0.5 + 0.5, 0.0, 1.0)
+            img_pil = to_pil_image(img_tensor.cpu())
+            ax = axes[b][col] if batch_size > 1 else axes[col]
+            ax.imshow(img_pil)
+            ax.axis('off')  # Remove axis ticks
+
+            # Prepare attribute labels for the current image
+            attr_labels = list_attri_dicts[col].keys()
+            attr_values = [list_attri_dicts[col][attr][b].item() for attr in attr_labels]
+            label_text = ", ".join(f"{attr}: {int(value)}" for attr, value in zip(attr_labels, attr_values))
+
+            # Set the title with the attribute information above each image
+            ax.set_title(label_text, fontsize=8)
+
+    # Adjust layout and save the figure
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close(fig)

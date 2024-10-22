@@ -7,7 +7,7 @@ def compute_alpha(beta, t):
     return a
 
 
-def generalized_steps(x, seq, model, b, **kwargs):
+def generalized_steps(x, seq, model, b, y=None, **kwargs):
     with torch.no_grad():
         n = x.size(0)
         seq_next = [-1] + list(seq[:-1])
@@ -19,7 +19,10 @@ def generalized_steps(x, seq, model, b, **kwargs):
             at = compute_alpha(b, t.long())
             at_next = compute_alpha(b, next_t.long())
             xt = xs[-1].to('cuda')
-            et = model(xt, t)
+            if y is not None:
+                et = model(xt, t, y)
+            else:
+                et = model(xt, t)
             x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
             x0_preds.append(x0_t.to('cpu'))
             c1 = (
